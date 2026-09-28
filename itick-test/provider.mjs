@@ -15,6 +15,7 @@ export class ITickProvider extends EventEmitter {
     this.latest = {};
     this.tickHistory = new Map();
     this.restCache = new Map();
+    this.klineCache = new Map();
     this.restNextAt = 0;
     this.ws = null;
     this.pingTimer = null;
@@ -82,6 +83,36 @@ export class ITickProvider extends EventEmitter {
     return ((last / first) - 1) * 100;
   }
 
+  async restJson(path) {
+    const wait = this.restNextAt - Date.now();
+    if (wait > 0) await sleep(wait);
+    this.restNextAt = Date.now() + 12_500;
+    const res = await fetch(`${this.restBase}${path}`, {
+      headers: { accept: 'application/json', token: this.token }
+    });
+    const body = await res.json().catch(async () => ({ code: -1, msg: await res.text().catch(() => '') }));
+    if (!res.ok || body?.code !== 0) throw new Error(body?.msg || `iTick HTTP ${res.status}`);
+    return body?.data;
+  }
+
+  async dailyBars(symbol, { limit = 260, maxAgeMs = 30 * 60_000 } = {}) {
+    symbol = String(symbol || '').trim().toUpperCase();
+    if (!/^[A-Z0-9]{2,12}$/.test(symbol)) throw new Error('Geçersiz sembol');
+    const key = `${symbol}:${limit}`;
+    const cached = this.klineCache.get(key);
+    if (cached && Date.now() - cached.at < maxAgeMs) return cached.data;
+
+    const path = `/stock/kline?region=${encodeURIComponent(this.region)}&code=${encodeURIComponent(symbol)}&kType=8&limit=${encodeURIComponent(limit)}`;
+    const data = await this.restJson(path);
+    if (!Array.isArray(data) || !data.length) throw new Error('Tarihsel veri alınamadı');
+    const bars = data.map((b) => ({
+      t: Number(b.t), o: Number(b.o), h: Number(b.h), l: Number(b.l),
+      c: Number(b.c), v: Number(b.v || 0), tu: Number(b.tu || 0)
+    })).filter((b) => Number.isFinite(b.t) && Number.isFinite(b.c));
+    this.klineCache.set(key, { at: Date.now(), data: bars });
+    return bars;
+  }
+
   async quote(symbol, { preferLive = true } = {}) {
     symbol = String(symbol || '').trim().toUpperCase();
     if (!/^[A-Z0-9]{2,12}$/.test(symbol)) throw new Error('Geçersiz sembol');
@@ -94,17 +125,9 @@ export class ITickProvider extends EventEmitter {
     const cached = this.restCache.get(symbol);
     if (cached && Date.now() - cached.at < 12_000) return { ...cached.data, source: 'rest-cache' };
 
-    const wait = this.restNextAt - Date.now();
-    if (wait > 0) await sleep(wait);
-    this.restNextAt = Date.now() + 12_500;
-
-    const url = `${this.restBase}/stock/quote?region=${encodeURIComponent(this.region)}&code=${encodeURIComponent(symbol)}`;
-    const res = await fetch(url, { headers: { accept: 'application/json', token: this.token } });
-    const body = await res.json().catch(async () => ({ code: -1, msg: await res.text().catch(() => '') }));
-    if (!res.ok || body?.code !== 0 || !body?.data) {
-      throw new Error(body?.msg || `iTick HTTP ${res.status}`);
-    }
-    const item = this.normalize(body.data);
+    const data = await this.restJson(`/stock/quote?region=${encodeURIComponent(this.region)}&code=${encodeURIComponent(symbol)}`);
+    if (!data) throw new Error('Quote verisi alınamadı');
+    const item = this.normalize(data);
     this.restCache.set(symbol, { at: Date.now(), data: item });
     return { ...item, source: 'rest' };
   }
@@ -112,6 +135,13 @@ export class ITickProvider extends EventEmitter {
   start() {
     if (!this.token) throw new Error('ITICK_API_KEY missing');
     this.connect();
+    for (const [i, symbol] of this.symbols.entries()) {
+      setTimeout(() => {
+        this.dailyBars(symbol).then((bars) => {
+          console.log(`Daily bars cached ${symbol}: ${bars.length}`);
+        }).catch((err) => console.error(`Daily bars error ${symbol}`, err?.message || err));
+      }, i * 13_000);
+    }
   }
 
   connect() {
