@@ -103,8 +103,12 @@ function startWs() {
     }
 
     if (msg?.resAc || !msg?.data) {
-      state.lastControlMessage = msg;
-      console.log("CONTROL", JSON.stringify(msg));
+      const safeMsg = JSON.parse(JSON.stringify(msg));
+      if (safeMsg?.data?.params && String(safeMsg.data.params).length > 16) {
+        safeMsg.data.params = "[REDACTED]";
+      }
+      state.lastControlMessage = safeMsg;
+      console.log("CONTROL", JSON.stringify(safeMsg));
       if (msg?.resAc === "auth" && msg?.code === 1) {
         state.authenticated = true;
         subscribe();
